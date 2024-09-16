@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use crate::config::get_setting;
+use crate::config::{self, get_setting};
 //
 // CRATES
 //
@@ -15,6 +15,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::str::FromStr;
+use std::string::ToString;
 use time::{macros::format_description, Duration, OffsetDateTime};
 use url::Url;
 
@@ -169,6 +170,7 @@ pub struct Media {
 	pub width: i64,
 	pub height: i64,
 	pub poster: String,
+	pub download_name: String,
 }
 
 impl Media {
@@ -235,6 +237,15 @@ impl Media {
 
 		let alt_url = alt_url_val.map_or(String::new(), |val| format_url(val.as_str().unwrap_or_default()));
 
+		let download_name = if post_type == "image" || post_type == "gif" || post_type == "video" {
+			let permalink_base = url_path_basename(data["permalink"].as_str().unwrap_or_default());
+			let media_url_base = url_path_basename(url_val.as_str().unwrap_or_default());
+
+			format!("redlib_{permalink_base}_{media_url_base}")
+		} else {
+			String::new()
+		};
+
 		(
 			post_type.to_string(),
 			Self {
@@ -245,6 +256,7 @@ impl Media {
 				width: source["width"].as_i64().unwrap_or_default(),
 				height: source["height"].as_i64().unwrap_or_default(),
 				poster: format_url(source["url"].as_str().unwrap_or_default()),
+				download_name,
 			},
 			gallery,
 		)
@@ -298,6 +310,7 @@ pub struct Post {
 	pub body: String,
 	pub author: Author,
 	pub permalink: String,
+	pub link_title: String,
 	pub poll: Option<Poll>,
 	pub score: (String, String),
 	pub upvote_ratio: i64,
@@ -315,6 +328,7 @@ pub struct Post {
 	pub gallery: Vec<GalleryMedia>,
 	pub awards: Awards,
 	pub nsfw: bool,
+	pub out_url: Option<String>,
 	pub ws_url: String,
 }
 
@@ -388,6 +402,7 @@ impl Post {
 					width: data["thumbnail_width"].as_i64().unwrap_or_default(),
 					height: data["thumbnail_height"].as_i64().unwrap_or_default(),
 					poster: String::new(),
+					download_name: String::new(),
 				},
 				media,
 				domain: val(post, "domain"),
@@ -411,6 +426,7 @@ impl Post {
 					stickied: data["stickied"].as_bool().unwrap_or_default() || data["pinned"].as_bool().unwrap_or_default(),
 				},
 				permalink: val(post, "permalink"),
+				link_title: val(post, "link_title"),
 				poll: Poll::parse(&data["poll_data"]),
 				rel_time,
 				created,
@@ -421,10 +437,9 @@ impl Post {
 				awards,
 				nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
 				ws_url: val(post, "websocket_url"),
+				out_url: post["data"]["url_overridden_by_dest"].as_str().map(|a| a.to_string()),
 			});
 		}
-		posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
-		posts.sort_by(|a, b| b.flags.stickied.cmp(&a.flags.stickied));
 		Ok((posts, res["data"]["after"].as_str().unwrap_or_default().to_string()))
 	}
 }
@@ -715,6 +730,7 @@ pub async fn parse_post(post: &Value) -> Post {
 			distinguished: val(post, "distinguished"),
 		},
 		permalink,
+		link_title: val(post, "link_title"),
 		poll,
 		score: format_num(score),
 		upvote_ratio: ratio as i64,
@@ -726,6 +742,7 @@ pub async fn parse_post(post: &Value) -> Post {
 			width: post["data"]["thumbnail_width"].as_i64().unwrap_or_default(),
 			height: post["data"]["thumbnail_height"].as_i64().unwrap_or_default(),
 			poster: String::new(),
+			download_name: String::new(),
 		},
 		flair: Flair {
 			flair_parts: FlairPart::parse(
@@ -756,6 +773,7 @@ pub async fn parse_post(post: &Value) -> Post {
 		awards,
 		nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
 		ws_url: val(post, "websocket_url"),
+		out_url: post["data"]["url_overridden_by_dest"].as_str().map(|a| a.to_string()),
 	}
 }
 
@@ -1068,6 +1086,28 @@ pub fn sfw_only() -> bool {
 	}
 }
 
+/// Returns true if the config/env variable REDLIB_ENABLE_RSS is set to "on".
+/// If this variable is set as such, the instance will enable RSS feeds.
+/// Otherwise, the instance will not provide RSS feeds.
+pub fn enable_rss() -> bool {
+	match get_setting("REDLIB_ENABLE_RSS") {
+		Some(val) => val == "on",
+		None => false,
+	}
+}
+
+/// Returns true if the config/env variable `REDLIB_ROBOTS_DISABLE_INDEXING` carries the
+/// value `on`.
+///
+/// If this variable is set as such, the instance will block all robots in robots.txt and
+/// insert the noindex, nofollow meta tag on every page.
+pub fn disable_indexing() -> bool {
+	match get_setting("REDLIB_ROBOTS_DISABLE_INDEXING") {
+		Some(val) => val == "on",
+		None => false,
+	}
+}
+
 // Determines if a request shoud redirect to a nsfw landing gate.
 pub fn should_be_nsfw_gated(req: &Request<Body>, req_url: &str) -> bool {
 	let sfw_instance = sfw_only();
@@ -1107,6 +1147,34 @@ pub async fn nsfw_landing(req: Request<Body>, req_url: String) -> Result<Respons
 	.unwrap_or_default();
 
 	Ok(Response::builder().status(403).header("content-type", "text/html").body(body.into()).unwrap_or_default())
+}
+
+// Returns the last (non-empty) segment of a path string
+pub fn url_path_basename(path: &str) -> String {
+	let url_result = Url::parse(format!("https://libredd.it/{path}").as_str());
+
+	if url_result.is_err() {
+		path.to_string()
+	} else {
+		let mut url = url_result.unwrap();
+		url.path_segments_mut().unwrap().pop_if_empty();
+
+		url.path_segments().unwrap().last().unwrap().to_string()
+	}
+}
+
+// Returns the URL of a post, as needed by RSS feeds
+pub fn get_post_url(post: &Post) -> String {
+	if let Some(out_url) = &post.out_url {
+		// Handle cross post
+		if out_url.starts_with("/r/") {
+			format!("{}{}", config::get_setting("REDLIB_FULL_URL").unwrap_or_default(), out_url)
+		} else {
+			out_url.to_string()
+		}
+	} else {
+		format!("{}{}", config::get_setting("REDLIB_FULL_URL").unwrap_or_default(), post.permalink)
+	}
 }
 
 #[cfg(test)]
@@ -1216,4 +1284,20 @@ fn test_rewriting_image_links() {
 		r#"<p><a href="https://preview.redd.it/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc">caption 1</a></p>"#;
 	let output = r#"<p><figure><a href="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"><img loading="lazy" src="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"></a><figcaption>caption 1</figcaption></figure></p"#;
 	assert_eq!(rewrite_urls(input), output);
+}
+
+#[test]
+fn test_url_path_basename() {
+	// without trailing slash
+	assert_eq!(url_path_basename("/first/last"), "last");
+	// with trailing slash
+	assert_eq!(url_path_basename("/first/last/"), "last");
+	// with query parameters
+	assert_eq!(url_path_basename("/first/last/?some=query"), "last");
+	// file path
+	assert_eq!(url_path_basename("/cdn/image.jpg"), "image.jpg");
+	// when a full url is passed instead of just a path
+	assert_eq!(url_path_basename("https://doma.in/first/last"), "last");
+	// empty path
+	assert_eq!(url_path_basename("/"), "");
 }
