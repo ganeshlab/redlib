@@ -29,6 +29,11 @@ RUN echo "finished building redlib!"
 ########################
 FROM ubuntu:${UBUNTU_RELEASE_VERSION} AS release
 
+# Fix health check
+RUN apt-get update \
+    && apt-get -y install wget \
+    && rm -rf /var/lib/apt/lists/*
+    
 # Import redlib binary from builder
 COPY --from=builder /redlib/target/release/redlib /usr/local/bin/redlib
 
